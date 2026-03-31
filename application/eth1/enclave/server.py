@@ -1,113 +1,171 @@
-#  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-#  SPDX-License-Identifier: MIT-0
-
-import base64
 import json
 import os
 import socket
-import subprocess
-
-import web3
-from web3.auto import w3
+import uuid
 
 
-def kms_call(credential, ciphertext):
-    aws_access_key_id = credential["access_key_id"]
-    aws_secret_access_key = credential["secret_access_key"]
-    aws_session_token = credential["token"]
+class WalletNotFoundError(Exception):
+    def __init__(self, wallet_id):
+        self.wallet_id = wallet_id
+        super().__init__(wallet_id)
 
-    subprocess_args = [
-        "/app/kmstool_enclave_cli",
-        "decrypt",
-        "--region",
-        os.getenv("REGION"),
-        "--proxy-port",
-        "8000",
-        "--aws-access-key-id",
-        aws_access_key_id,
-        "--aws-secret-access-key",
-        aws_secret_access_key,
-        "--aws-session-token",
-        aws_session_token,
-        "--ciphertext",
-        ciphertext,
-    ]
 
-    print("subprocess args: {}".format(subprocess_args))
+class Web3WalletBackend:
+    def create_account(self):
+        from web3 import Account
 
-    proc = subprocess.Popen(subprocess_args, stdout=subprocess.PIPE)
+        account = Account.create()
+        private_key = getattr(account, "key", None) or getattr(account, "privateKey")
+        if isinstance(private_key, bytes):
+            private_key = private_key.hex()
+        return {"private_key": private_key, "address": account.address}
 
-    # returns b64 encoded plaintext
-    result_b64 = proc.communicate()[0].decode()
-    plaintext_b64 = result_b64.split(":")[1].strip()
+    def sign_transaction(self, transaction_payload, private_key):
+        import web3
+        from web3.auto import w3
 
-    return plaintext_b64
+        tx = dict(transaction_payload)
+        if "value" in tx and isinstance(tx["value"], str):
+            tx["value"] = web3.Web3.toWei(tx["value"], "ether")
+        transaction_signed = w3.eth.account.sign_transaction(tx, private_key)
+        return {
+            "signed_tx": transaction_signed.rawTransaction.hex(),
+            "tx_hash": transaction_signed.hash.hex(),
+        }
+
+
+def default_attestation_provider():
+    return {
+        "quote": os.getenv("QINGTIAN_ATTESTATION_QUOTE", "quote-unavailable"),
+        "measurement": os.getenv(
+            "QINGTIAN_ATTESTATION_MEASUREMENT", "measurement-unavailable"
+        ),
+    }
+
+
+def get_wallet_store(wallet_store=None):
+    return wallet_store if wallet_store is not None else WALLET_STORE
+
+
+def get_wallet_backend(wallet_backend=None):
+    return wallet_backend if wallet_backend is not None else Web3WalletBackend()
+
+
+def create_wallet(wallet_store=None, wallet_backend=None, wallet_id_factory=None):
+    wallet_store = get_wallet_store(wallet_store)
+    wallet_backend = get_wallet_backend(wallet_backend)
+    wallet_id_factory = wallet_id_factory or (lambda: str(uuid.uuid4()))
+
+    account = wallet_backend.create_account()
+    wallet_id = wallet_id_factory()
+    wallet_store[wallet_id] = account
+    return {"wallet_id": wallet_id, "address": account["address"]}
+
+
+def get_wallet_entry(wallet_id, wallet_store=None):
+    wallet_store = get_wallet_store(wallet_store)
+    entry = wallet_store.get(wallet_id)
+    if not entry:
+        raise WalletNotFoundError(wallet_id)
+    return entry
+
+
+def get_address(wallet_id, wallet_store=None):
+    entry = get_wallet_entry(wallet_id, wallet_store=wallet_store)
+    return {"wallet_id": wallet_id, "address": entry["address"]}
+
+
+def sign_transaction(
+    wallet_id, transaction_payload, wallet_store=None, wallet_backend=None
+):
+    validate_transaction_payload(transaction_payload)
+
+    entry = get_wallet_entry(wallet_id, wallet_store=wallet_store)
+    wallet_backend = get_wallet_backend(wallet_backend)
+    signed = wallet_backend.sign_transaction(transaction_payload, entry["private_key"])
+    return {"wallet_id": wallet_id, **signed}
+
+
+def get_attestation(attestation_provider=None):
+    provider = attestation_provider or default_attestation_provider
+    return provider()
+
+
+def validate_transaction_payload(transaction_payload):
+    if not isinstance(transaction_payload, dict):
+        raise ValueError("transaction_payload must be a JSON object")
+
+    required_fields = ("chainId", "gas", "nonce")
+    missing_fields = [field for field in required_fields if field not in transaction_payload]
+    if missing_fields:
+        raise ValueError(
+            "transaction_payload missing required fields: {}".format(
+                ", ".join(sorted(missing_fields))
+            )
+        )
+
+
+def process_request(
+    request,
+    wallet_store=None,
+    wallet_backend=None,
+    attestation_provider=None,
+    wallet_id_factory=None,
+):
+    action = request.get("action")
+
+    try:
+        if action == "create_wallet":
+            return create_wallet(
+                wallet_store=wallet_store,
+                wallet_backend=wallet_backend,
+                wallet_id_factory=wallet_id_factory,
+            )
+        if action == "get_address":
+            return get_address(request["wallet_id"], wallet_store=wallet_store)
+        if action == "sign_transaction":
+            return sign_transaction(
+                request["wallet_id"],
+                request["transaction_payload"],
+                wallet_store=wallet_store,
+                wallet_backend=wallet_backend,
+            )
+        if action == "get_attestation":
+            return get_attestation(attestation_provider=attestation_provider)
+        if action == "health":
+            return {"status": "ok"}
+        return {"status": "error", "error": "unsupported_action", "action": action}
+    except WalletNotFoundError as exc:
+        return {
+            "status": "error",
+            "error": "wallet_not_found",
+            "wallet_id": exc.wallet_id,
+        }
+    except (KeyError, ValueError) as exc:
+        return {"status": "error", "error": "invalid_request", "message": str(exc)}
+    except Exception as exc:
+        return {"status": "error", "error": "internal_error", "message": str(exc)}
 
 
 def main():
-    print("Starting server...")
+    print("Starting TEE wallet core...")
 
-    # Create a vsock socket object
     s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
-
-    # Listen for connection from any CID
     cid = socket.VMADDR_CID_ANY
-
-    # The port should match the client running in parent EC2 instance
-    port = 5000
-
-    # Bind the socket to CID and port
+    port = int(os.getenv("TEE_VSOCK_PORT", "5000"))
     s.bind((cid, port))
-
-    # Listen for connection from client
     s.listen()
 
     while True:
-        c, addr = s.accept()
-
-        # Get AWS credential sent from parent instance
+        c, _addr = s.accept()
         payload = c.recv(4096)
         payload_json = json.loads(payload.decode())
-        print("payload json: {}".format(payload_json))
-
-        credential = payload_json["credential"]
-        transaction_dict = payload_json["transaction_payload"]
-        key_encrypted = payload_json["encrypted_key"]
-
-        try:
-            key_b64 = kms_call(credential, key_encrypted)
-        except Exception as e:
-            msg = "exception happened calling kms binary: {}".format(e)
-            print(msg)
-            response_plaintext = msg
-
-        else:
-            key_plaintext = base64.standard_b64decode(key_b64).decode()
-
-            try:
-                transaction_dict["value"] = web3.Web3.toWei(
-                    transaction_dict["value"], "ether"
-                )
-                transaction_signed = w3.eth.account.sign_transaction(
-                    transaction_dict, key_plaintext
-                )
-                response_plaintext = {
-                    "transaction_signed": transaction_signed.rawTransaction.hex(),
-                    "transaction_hash": transaction_signed.hash.hex(),
-                }
-
-            except Exception as e:
-                msg = "exception happened signing the transaction: {}".format(e)
-                print(msg)
-                response_plaintext = msg
-
-            # delete internal reference to plain text password
-            del key_plaintext
-
-        print("response_plaintext: {}".format(response_plaintext))
-
+        response_plaintext = process_request(payload_json)
         c.send(str.encode(json.dumps(response_plaintext)))
         c.close()
+
+
+WALLET_STORE = {}
 
 
 if __name__ == "__main__":

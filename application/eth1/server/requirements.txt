@@ -1,1 +1,1 @@
-boto3==1.17.103
+# No extra runtime dependency for the local HTTP gateway v1.

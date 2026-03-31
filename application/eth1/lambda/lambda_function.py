@@ -1,146 +1,52 @@
-#  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-#  SPDX-License-Identifier: MIT-0
-
-import base64
 import json
-import logging
 import os
-import ssl
 from http import client
 
-import boto3
 
-ssl_context = ssl.SSLContext()
-ssl_context.verify_mode = ssl.CERT_NONE
+def get_env(name, default=None):
+    return os.getenv(name, default)
 
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "WARNING")
-LOG_FORMAT = "%(levelname)s:%(lineno)s:%(message)s"
-handler = logging.StreamHandler()
-
-_logger = logging.getLogger("tx_manager_controller")
-_logger.setLevel(LOG_LEVEL)
-_logger.addHandler(handler)
-_logger.propagate = False
-
-client_kms = boto3.client("kms")
-client_secrets_manager = boto3.client("secretsmanager")
+def request_gateway(method, path, body=None):
+    gateway_host = get_env("TEE_WALLET_HOST", "127.0.0.1")
+    gateway_port = int(get_env("TEE_WALLET_PORT", "8080"))
+    conn = client.HTTPConnection(gateway_host, gateway_port)
+    payload = json.dumps(body) if body is not None else None
+    headers = {"Content-Type": "application/json"} if body is not None else {}
+    conn.request(method, path, body=payload, headers=headers)
+    response = conn.getresponse()
+    response_raw = response.read()
+    conn.close()
+    return json.loads(response_raw)
 
 
 def lambda_handler(event, context):
-    """
-    example requests
-    {
-      "operation": "set_key",
-      "eth_key": "123"
-    }
-
-    {
-      "operation": "get_key"
-    }
-
-    {
-      "operation": "sign_transaction",
-      "transaction_payload": {
-        "value": 0.01,
-        "to": "0xa5D3241A1591061F2a4bB69CA0215F66520E67cf",
-        "nonce": 0,
-        "type": 2,
-        "chainId": 4,
-        "gas": 100000,
-        "maxFeePerGas": 100000000000,
-        "maxPriorityFeePerGas": 3000000000
-        }
-    }
-
-    """
-    nitro_instance_private_dns = os.getenv("NITRO_INSTANCE_PRIVATE_DNS")
-    secret_id = os.getenv("SECRET_ARN")
-    key_id = os.getenv("KEY_ARN")
-
-    if not (nitro_instance_private_dns and secret_id and key_id):
-        _logger.fatal(
-            "NITRO_INSTANCE_PRIVATE_DNS, SECRET_ARN and KEY_ARN environment variables need to be set"
-        )
-
     operation = event.get("operation")
-    if not operation:
-        _logger.fatal("request needs to define operation")
 
-    if operation == "set_key":
-        key_plaintext = event.get("eth_key")
+    if operation == "create_wallet":
+        return request_gateway("POST", "/wallets")
 
-        try:
-            response = client_kms.encrypt(
-                KeyId=key_id, Plaintext=key_plaintext.encode()
-            )
-        except Exception as e:
-            raise Exception(
-                "exception happened sending decryption request to KMS: {}".format(e)
-            )
+    if operation == "get_address":
+        wallet_id = event.get("wallet_id")
+        if not wallet_id:
+            raise RuntimeError("get_address requires wallet_id")
+        return request_gateway("GET", f"/wallets/{wallet_id}/address")
 
-        _logger.debug("response: {}".format(response))
-        response_b64 = base64.standard_b64encode(response["CiphertextBlob"]).decode()
-
-        try:
-            response = client_secrets_manager.update_secret(
-                SecretId=secret_id,
-                # rely on the AWS managed key for std. storage
-                SecretString=response_b64,
-            )
-        except Exception as e:
-            raise Exception("exception happened updating secret: {}".format(e))
-
-        return response
-
-    elif operation == "get_key":
-        try:
-            response = client_secrets_manager.get_secret_value(SecretId=secret_id)
-        except Exception as e:
-            raise Exception(
-                "exception happened reading secret from secrets manager: {}".format(e)
-            )
-
-        return response["SecretString"]
-
-    # sign_transaction
-
-    elif operation == "sign_transaction":
+    if operation == "sign_transaction":
+        wallet_id = event.get("wallet_id")
         transaction_payload = event.get("transaction_payload")
-
-        if not transaction_payload:
-            raise Exception(
-                "sign_transaction requires transaction_payload and secret_id optionally"
-            )
-
-        https_nitro_client = client.HTTPSConnection(
-            "{}:{}".format(nitro_instance_private_dns, 443), context=ssl_context
+        if not wallet_id or not transaction_payload:
+            raise RuntimeError("sign_transaction requires wallet_id and transaction_payload")
+        return request_gateway(
+            "POST",
+            f"/wallets/{wallet_id}/sign",
+            {"transaction_payload": transaction_payload},
         )
 
-        try:
-            https_nitro_client.request(
-                "POST",
-                "/",
-                body=json.dumps(
-                    {"transaction_payload": transaction_payload, "secret_id": secret_id}
-                ),
-            )
-            response = https_nitro_client.getresponse()
-        except Exception as e:
-            raise Exception(
-                "exception happened sending decryption request to Nitro Enclave: {}".format(
-                    e
-                )
-            )
+    if operation == "get_attestation":
+        return request_gateway("GET", "/attestation")
 
-        _logger.debug("response: {} {}".format(response.status, response.reason))
+    if operation == "health":
+        return request_gateway("GET", "/health")
 
-        response_raw = response.read()
-
-        _logger.debug("response data: {}".format(response_raw))
-        response_parsed = json.loads(response_raw)
-
-        return response_parsed
-
-    else:
-        _logger.fatal("operation: {} not supported right now".format(operation))
+    raise RuntimeError("operation: {} not supported right now".format(operation))

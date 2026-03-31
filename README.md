@@ -39,59 +39,46 @@ For Nitro Enclave advanced networking patterns, please refer to the respective a
 
 ```mermaid
 flowchart LR
-    caller["Caller / Lambda test console"]
+    caller["Caller / local test client"]
+    gateway["Host local HTTP gateway\napplication/eth1/server/app.py"]
+    bridge["TEE IPC bridge\nAF_VSOCK CID 16 port 5000"]
 
-    subgraph lambda["Lambda function\napplication/eth1/lambda/lambda_function.py"]
-        lambda_set["set_key"]
-        lambda_sign["sign_transaction"]
+    subgraph enclave["Huawei Cloud QingTian Enclave\napplication/eth1/enclave/server.py"]
+        core["TEE wallet core"]
+        registry["In-memory key registry"]
+        attest["Quote / measurement export"]
     end
 
-    subgraph aws["AWS managed services"]
-        kms["AWS KMS"]
-        sm["AWS Secrets Manager"]
-    end
-
-    subgraph parent["EC2 parent instance\napplication/eth1/server/app.py"]
-        https_server["HTTPS server on port 443"]
-        imds["IMDSv2\nretrieve instance role credentials"]
-        vsock["AF_VSOCK client\nconnect to CID 16 port 5000"]
-    end
-
-    subgraph enclave["Nitro Enclave\napplication/eth1/enclave/server.py"]
-        enclave_server["AF_VSOCK server"]
-        kmstool["/app/kmstool_enclave_cli decrypt"]
-        signer["web3.py signs transaction"]
-    end
-
-    caller -->|"invoke set_key"| lambda_set
-    lambda_set -->|"kms:Encrypt plaintext key"| kms
-    kms -->|"CiphertextBlob"| lambda_set
-    lambda_set -->|"store base64 ciphertext"| sm
-
-    caller -->|"invoke sign_transaction"| lambda_sign
-    lambda_sign -->|"HTTPS POST /\ntransaction_payload + secret_id"| https_server
-    https_server -->|"GetSecretValue(secret_id)"| sm
-    https_server -->|"request role credentials"| imds
-    https_server --> vsock
-    vsock -->|"credential + encrypted_key + transaction_payload"| enclave_server
-    enclave_server --> kmstool
-    kmstool -->|"attested kms:Decrypt"| kms
-    kms -->|"plaintext key"| kmstool
-    enclave_server --> signer
-    signer -->|"signed tx + tx hash"| enclave_server
-    enclave_server -->|"JSON response over vsock"| vsock
-    https_server -->|"HTTPS JSON response"| lambda_sign
-    lambda_sign -->|"signed transaction"| caller
+    caller -->|"POST /wallets"| gateway
+    caller -->|"GET /wallets/{wallet_id}/address"| gateway
+    caller -->|"POST /wallets/{wallet_id}/sign"| gateway
+    caller -->|"GET /attestation"| gateway
+    gateway --> bridge
+    bridge --> core
+    core --> registry
+    core --> attest
+    core -->|"wallet_id + address\nsigned_tx + tx_hash\nquote + measurement"| bridge
+    bridge --> gateway
+    gateway -->|"JSON response"| caller
 ```
 
 
 
-This flow reflects the code in this repository rather than only the high-level blog architecture:
+This v1 flow intentionally focuses on the wallet core rather than cloud key custody:
 
-- `set_key` does not enter the enclave. The Lambda function encrypts the Ethereum private key with KMS and stores the base64 ciphertext in Secrets Manager.
-- `sign_transaction` enters the enclave only after the Lambda function calls the HTTPS service running on the EC2 parent instance.
-- The EC2 parent instance reads the encrypted key from Secrets Manager, fetches temporary IAM credentials from IMDSv2, and forwards both over `AF_VSOCK`.
-- The enclave runs [server.py](./application/eth1/enclave/server.py), invokes `kmstool_enclave_cli` for attested KMS decrypt, and signs the transaction locally. The plaintext key is intended to exist only inside the enclave process during signing.
+- `create_wallet` happens inside the enclave. The private key is generated in the TEE and stored only in the enclave process memory.
+- The host gateway only parses local HTTP requests and forwards them over `AF_VSOCK`; it never sees plaintext private keys.
+- `get_address` and `sign_transaction` both resolve the wallet by `wallet_id` inside the enclave.
+- `get_attestation` only exports quote and measurement values for inspection in v1; it does not yet implement a full remote verification workflow.
+- Restarting the enclave clears the in-memory wallet registry. This is expected behavior in v1.
+
+### Local TODO
+
+- `TODO: replace in-memory key registry with external encrypted/sealed storage`
+- `TODO: add recovery/restore workflow`
+- `TODO: add policy-based signing controls`
+
+The remainder of this README documents the legacy AWS Nitro deployment flow kept for historical reference. It does not describe the current QingTian wallet-core v1 path.
 
 ## Deploying the solution with AWS CDK
 

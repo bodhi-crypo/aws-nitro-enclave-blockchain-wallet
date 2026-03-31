@@ -1,16 +1,13 @@
-#  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-#  SPDX-License-Identifier: MIT-0
-
-FROM python:3.8
+FROM python:3.11-slim
 
 WORKDIR /usr/src/app
 
-COPY ./app.py ./
+# Build this image with application/eth1 as the Docker build context.
+COPY ./server/app.py ./app.py
+COPY ./server/requirements.txt ./requirements.txt
 
-COPY requirements.txt ./
 RUN pip3 install -r /usr/src/app/requirements.txt
 
-ARG REGION_ARG=us-east-1
-ENV REGION=$REGION_ARG
+ENV PORT=8080
 
-CMD [ "python", "./app.py" ]
+CMD ["python", "./app.py"]
