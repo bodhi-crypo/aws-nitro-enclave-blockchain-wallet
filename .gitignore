@@ -13,6 +13,7 @@ workbook.txt
 .idea
 .venv
 cdk.context.json
+.worktrees/
 application/eth1/enclave/kms/*
 pplication/eth1/enclave/proxy/*
 key
