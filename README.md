@@ -72,6 +72,33 @@ This v1 flow intentionally focuses on the wallet core rather than cloud key cust
 - `get_attestation` only exports quote and measurement values for inspection in v1; it does not yet implement a full remote verification workflow.
 - Restarting the enclave clears the in-memory wallet registry. This is expected behavior in v1.
 
+### Benchmarking `sign_transaction`
+
+Once the local HTTP gateway and enclave are already running, you can benchmark end-to-end signing throughput and latency with:
+
+```bash
+python3 scripts/bench_eth1_sign.py \
+  --base-url http://127.0.0.1:8080 \
+  --concurrency 8 \
+  --wallet-count 8 \
+  --warmup-seconds 5 \
+  --duration-seconds 15
+```
+
+The benchmark script:
+
+- pre-creates one wallet per worker by default,
+- drives `POST /wallets/{wallet_id}/sign` at fixed concurrency,
+- reports `TPS`, `avg/p50/p95/p99/min/max` latency, success/failure counts, and error breakdowns,
+- can emit a JSON summary with `--report-json <path>`.
+
+Useful knobs:
+
+- `--concurrency`: number of parallel signing workers
+- `--wallet-count`: number of wallets created before the run, must be `>= concurrency`
+- `--timeout-seconds`: per-request timeout for both wallet creation and signing
+- `--chain-id`, `--gas`, `--to`, `--value-ether`, `--max-fee-per-gas`, `--max-priority-fee-per-gas`: transaction template used by every worker while each worker increments its own `nonce`
+
 ### Local TODO
 
 - `TODO: replace in-memory key registry with external encrypted/sealed storage`
