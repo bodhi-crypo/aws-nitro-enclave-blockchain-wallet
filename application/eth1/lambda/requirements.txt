@@ -1,1 +1,0 @@
-# Legacy compatibility client for the local gateway only.
