@@ -93,6 +93,15 @@ qt enclave make-img --docker-uri tee-wallet-enclave:v1 --eif /root/tee-wallet-en
 ls -lh /root/tee-wallet-enclave.eif
 ```
 
+当前仓库里的 enclave 镜像已经按 QingTian 调试结论做了兼容处理：
+
+- 不再让 `python3` 直接作为容器 `CMD`
+- 改为先执行 `/app/start.sh`
+- 再由 shell wrapper 启动 `python3 /app/server.py`
+- enclave 运行时固定为 `Python 3.10`，避免 `web3==5.23.0` 在 `Python 3.11` 下触发 `inspect.getargspec` 导入错误
+
+如果后续你重写 Dockerfile，优先保留这个启动结构。
+
 ## 4. 启动 Enclave
 
 第一次建议用 debug 模式启动，方便查看 console：
@@ -327,6 +336,14 @@ qt enclave query
 - `AF_VSOCK` 监听逻辑的问题
 
 故障边界已经收敛到 `QingTian guest/runtime 层`，而不是 `wallet core` 应用层。
+
+后续继续细化后，已经额外确认了一点：
+
+- 官方 `ubuntu + hello_enclave.sh` 可以稳定运行
+- `python3` 直接作为容器 `CMD` 时，镜像会在 QingTian 内秒退
+- 通过 shell wrapper 启动 `python3` 可以正常运行
+
+因此当前仓库里的 `application/eth1/enclave/Dockerfile` 已经切换为 `start.sh -> python3 /app/server.py` 的启动方式，这不是风格调整，而是当前 QingTian 环境下的兼容性修复。
 
 可以按下面的故障树继续排查。
 

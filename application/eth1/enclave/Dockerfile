@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
 
 WORKDIR /app
 
@@ -7,5 +7,8 @@ COPY ./enclave/requirements.txt ./requirements.txt
 RUN pip3 install -r /app/requirements.txt
 
 COPY ./enclave/server.py ./server.py
+COPY ./enclave/start.sh ./start.sh
 
-CMD ["python3", "/app/server.py"]
+RUN chmod +x /app/start.sh
+
+CMD ["/app/start.sh"]

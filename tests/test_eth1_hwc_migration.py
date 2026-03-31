@@ -143,3 +143,18 @@ def test_readme_tracks_external_storage_todo():
     assert "TODO: replace in-memory key registry with external encrypted/sealed storage" in readme_text
     assert "TODO: add recovery/restore workflow" in readme_text
     assert "TODO: add policy-based signing controls" in readme_text
+
+
+def test_enclave_dockerfile_uses_shell_wrapper_entrypoint():
+    dockerfile_text = (REPO_ROOT / "application/eth1/enclave/Dockerfile").read_text()
+    start_script_text = (REPO_ROOT / "application/eth1/enclave/start.sh").read_text()
+
+    assert 'COPY ./enclave/start.sh ./start.sh' in dockerfile_text
+    assert 'CMD ["/app/start.sh"]' in dockerfile_text
+    assert "python3 /app/server.py" in start_script_text
+
+
+def test_enclave_dockerfile_pins_python_310_for_web3_compatibility():
+    dockerfile_text = (REPO_ROOT / "application/eth1/enclave/Dockerfile").read_text()
+
+    assert "FROM python:3.10-slim" in dockerfile_text
