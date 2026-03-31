@@ -191,6 +191,90 @@ curl -s http://127.0.0.1:8080/wallets/<old_wallet_id>/address | jq
 
 预期钱包不存在。这说明当前实现确实是“只保存在 enclave 内存中”，符合 v1 设计。
 
+## 8. 压测签名 TPS 和耗时
+
+当前仓库提供了一个端到端 benchmark 脚本：
+
+```bash
+python3 scripts/bench_eth1_sign.py --help
+```
+
+它的测量口径是：
+
+- 通过宿主机 HTTP gateway 调用 `POST /wallets/{wallet_id}/sign`
+- 包含 HTTP + `AF_VSOCK` + enclave signing 的整体耗时
+- 默认固定并发模型
+- 默认预创建多个钱包，并让每个 worker 独占一个 wallet，自增自己的 `nonce`
+
+一个常用示例：
+
+```bash
+cd /root/tee-wallet
+python3 scripts/bench_eth1_sign.py \
+  --base-url http://127.0.0.1:8080 \
+  --concurrency 8 \
+  --wallet-count 8 \
+  --warmup-seconds 5 \
+  --duration-seconds 15 \
+  --timeout-seconds 10
+```
+
+如果想保存结构化结果：
+
+```bash
+python3 scripts/bench_eth1_sign.py \
+  --concurrency 8 \
+  --wallet-count 8 \
+  --duration-seconds 15 \
+  --report-json /tmp/eth1-bench.json
+cat /tmp/eth1-bench.json | jq
+```
+
+输出重点包括：
+
+- `tps`
+- `total_requests`
+- `successful_requests`
+- `failed_requests`
+- `latency_ms_avg`
+- `latency_ms_p50`
+- `latency_ms_p95`
+- `latency_ms_p99`
+- `error_breakdown`
+
+如果压测中出现失败，脚本会保留统计结果，并以非零退出码结束，方便接到 CI 或自动化巡检里。
+
+建议先从较小并发开始，例如 `4` 或 `8`，再逐步提升到 `16`、`32`，观察：
+
+- TPS 是否继续线性增长
+- `p95/p99` 是否明显抬高
+- 是否出现 `timeout`、`http_error` 或 `network_error`
+
+一次实际样例记录：
+
+```bash
+[root@ecs-tee-wallet-test aws-nitro-enclave-blockchain-wallet]# python3 scripts/bench_eth1_sign.py --base-url http://127.0.0.1:8080 --concurrency 8 --wallet-count 8 --duration-seconds 15
+Benchmark configuration
+base_url: http://127.0.0.1:8080
+concurrency: 8
+wallet_count: 8
+warmup_seconds: 5.0
+duration_seconds: 15.0
+Benchmark results
+total_requests: 2312
+successful_requests: 2311
+failed_requests: 1
+elapsed_seconds: 15.167
+tps: 152.374
+latency_ms_avg: 51.993
+latency_ms_p50: 45.446865
+latency_ms_p95: 45.944895
+latency_ms_p99: 46.670864
+latency_ms_min: 7.908026
+```
+
+这组数据说明在 `8` 并发下，当前环境端到端签名吞吐大约在 `152 TPS`，中位延迟约 `45 ms`，但已经出现了 `1` 次失败请求。继续拉高并发前，建议先结合 gateway 和 enclave 日志定位失败原因。
+
 ## 下一步加固建议
 
 - 把宿主机 gateway 做成 `systemd` 服务

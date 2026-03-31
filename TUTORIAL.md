@@ -12,9 +12,29 @@ README.md：这个场景自己的部署说明。
 1. eth1
 路径：application/eth1
 
-这是整个 repo 的主线示例，也就是“区块链私钥保存在 KMS 密文中，解密和签名发生在 enclave 内”。
+当前主线不是旧版 AWS KMS custody 流程，而是 QingTian `wallet core v1`：
 
-Lambda 在 application/eth1/lambda/lambda_function.py 里处理 set_key 和 sign_transaction。
-Parent EC2 上的 HTTPS 服务在 application/eth1/server/app.py，它会读 Secrets Manager、取 IMDS 凭证，然后通过 AF_VSOCK 把数据送进 enclave。
-Enclave 内逻辑在 application/eth1/enclave/server.py，会调用 kmstool_enclave_cli 做 attested KMS decrypt，再用 web3.py 签名。
-这是“私钥只在 enclave 内短暂明文出现”的核心实现。
+- `application/eth1/server/app.py`
+  宿主机本地 HTTP gateway，对外暴露 `POST /wallets`、`GET /wallets/{wallet_id}/address`、`POST /wallets/{wallet_id}/sign`、`GET /attestation`。
+- `application/eth1/enclave/server.py`
+  enclave 内的钱包内核，负责生成私钥、维护内存态 wallet registry，以及实际交易签名。
+- `application/eth1/lambda/lambda_function.py`
+  只是兼容性客户端，转发给本地 gateway，不是主运行链路。
+
+这条路径的关键点是：
+
+- 私钥只在 enclave 内生成并保存在进程内存里。
+- 宿主机通过 `AF_VSOCK` 转发请求，但不会接触明文私钥。
+- enclave 重启后钱包状态会丢失，这是当前 v1 的预期行为。
+
+如果你已经把 gateway 和 enclave 跑起来，可以直接用仓库里的压测脚本做端到端签名压测：
+
+```bash
+python3 scripts/bench_eth1_sign.py \
+  --base-url http://127.0.0.1:8080 \
+  --concurrency 8 \
+  --wallet-count 8 \
+  --duration-seconds 15
+```
+
+脚本会先预创建多个钱包，再并发调用 `POST /wallets/{wallet_id}/sign`，输出签名 `TPS` 和耗时分位数。
