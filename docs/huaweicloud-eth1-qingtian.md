@@ -43,6 +43,99 @@
   - `22/tcp` 仅放行你自己的公网 IP
   - `8080/tcp` 建议不要直接公网开放，优先使用 SSH 隧道测试
 
+## KMS IAM 身份策略配置
+
+第二阶段的 KMS 权限，应该挂在 **ECS 使用的 Agency/实例身份** 上，而不是挂给控制台登录用户。
+
+原因是当前运行链路里：
+
+- 宿主机从 metadata 获取 `securitykey` 临时凭证
+- enclave 内的 `qingtian_kms_bridge` 使用这组临时凭证调用 KMS
+- 所以真正访问 KMS 的身份，是这台 ECS 绑定的 Agency
+
+### 最小可用策略
+
+当前实现建议先使用只绑定 `PCR0` 的最小策略：
+
+```json
+{
+  "Version": "1.1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "kms:cmk:generate",
+        "kms:dek:create",
+        "kms:cmk:decrypt",
+        "kms:dek:decrypt"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Condition": {
+        "StringEqualsIgnoreCase": {
+          "kms:RecipientAttestation/PCR0": [
+            "<release EIF 的 PCR0>"
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+说明：
+
+- `Version` 必须是 `1.1`
+- 当前这一轮先只绑定 `PCR0`
+- 当前 EIF 没有启用镜像签名，因此 `PCR8` 还是全 `0`，先不要写进策略
+- `Resource` 先用 `"*"`，先把 attestation + KMS 路径跑通，后面再考虑收紧到指定 key
+
+### `PCR0` 如何获取
+
+必须使用最终 release 镜像对应的 EIF 来取值：
+
+```bash
+qt enclave make-img --docker-uri tee-wallet-enclave:v1 --eif /root/tee-wallet-enclave.eif
+```
+
+命令输出里会包含：
+
+- `PCR0`
+- `PCR8`
+
+当前阶段只把 `PCR0` 写进策略。
+
+注意：
+
+- 重新 build enclave 镜像后，`PCR0` 可能变化
+- 变化后需要同步更新 KMS policy
+- 不要使用 debug 阶段随手构建出来的临时 PCR 值
+
+### 权限动作含义
+
+当前这条链路里有两个容易混淆的权限：
+
+- `kms:cmk:decrypt`
+  作用是让 KMS 使用主密钥直接解密数据
+- `kms:dek:decrypt`
+  作用是让 KMS 解密数据密钥（DEK）
+
+放到当前方案里理解：
+
+- `createDataKey` 返回 `明文 DEK + 密文 DEK`
+- enclave 用明文 DEK 自己加密钱包私钥
+- 恢复时，先通过 `kms:dek:decrypt` 解出 DEK
+- 再由 enclave 自己解出钱包私钥
+
+所以从权限语义上看，当前第二阶段最核心的是：
+
+- `kms:cmk:generate`
+- `kms:dek:create`
+- `kms:dek:decrypt`
+
+而 `kms:cmk:decrypt` 作为保守可用权限先保留，避免官方 C SDK 在 `decryptDataKey` 路径下还隐式要求主密钥解密权限。
+
 ## 1. 初始化 ECS
 
 登录 ECS 后，先安装基础环境：
