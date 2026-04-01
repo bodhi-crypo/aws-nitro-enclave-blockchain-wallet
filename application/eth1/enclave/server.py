@@ -128,7 +128,7 @@ class HuaweiKmsClient:
             stderr = (process.stderr or process.stdout or "").strip()
             raise RuntimeError(f"KMS helper failed: {stderr}")
 
-        response = json.loads(process.stdout or "{}")
+        response = parse_helper_json_output(process.stdout or "")
         if response.get("status") == "error":
             raise RuntimeError(response.get("message", "KMS helper returned an error"))
         return response
@@ -253,6 +253,18 @@ def validate_transaction_payload(transaction_payload):
                 ", ".join(sorted(missing_fields))
             )
         )
+
+
+def parse_helper_json_output(stdout_text):
+    for line in reversed(stdout_text.splitlines()):
+        candidate = line.strip()
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    raise ValueError(f"KMS helper returned non-JSON output: {stdout_text.strip()}")
 
 
 def validate_wallet_record(wallet_record, wallet_id=None):

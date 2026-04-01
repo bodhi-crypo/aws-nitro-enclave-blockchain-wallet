@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <curl/curl.h>
 #include <glib.h>
 #include <json-c/json.h>
 #include <stdio.h>
@@ -19,6 +20,8 @@
 #define MAX_CIPHERTEXT_BYTES 8192
 #define MAX_PLAINTEXT_BYTES 4096
 #define SECURITY_TOKEN_HEADER "X-Security-Token"
+#define DECRYPT_DATAKEY_API "decrypt-datakey"
+#define HTTPS_OK 200
 
 typedef struct bridge_request_s {
     char *action;
@@ -34,6 +37,7 @@ typedef struct bridge_request_s {
 } bridge_request_t;
 
 static void free_request(bridge_request_t *request);
+static int decrypt_datakey_via_proxy(const bridge_request_t *request, sig_params_t *params, unsigned char *plaintext, unsigned int *plaintext_len);
 
 static void emit_error(const char *message)
 {
@@ -49,6 +53,23 @@ static void emit_success(struct json_object *payload)
 {
     fputs(json_object_to_json_string_ext(payload, JSON_C_TO_STRING_PLAIN), stdout);
     fputc('\n', stdout);
+}
+
+static size_t write_memory_callback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+    size_t real_size = size * nmemb;
+    sig_str_t *resp_data = (sig_str_t *)userp;
+
+    resp_data->data = malloc(real_size + 1);
+    if (resp_data->data == NULL) {
+        return 0;
+    }
+
+    resp_data->len = real_size + 1;
+    memset(resp_data->data, 0, real_size + 1);
+    memcpy(resp_data->data, contents, real_size);
+    resp_data->data[real_size] = '\0';
+    return real_size;
 }
 
 static char *read_stdin_payload(void)
@@ -240,6 +261,182 @@ static void cleanup_sig_params(sig_params_t *params)
     sig_params_free(params);
 }
 
+static int hex_to_bytes(const char *hex, unsigned char *output, unsigned int *output_len)
+{
+    size_t hex_len;
+    if (hex == NULL || output == NULL || output_len == NULL) {
+        return -1;
+    }
+    hex_len = strlen(hex);
+    if (hex_len % 2 != 0 || (*output_len) < hex_len / 2) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < hex_len / 2; i++) {
+        unsigned int value = 0;
+        if (sscanf(hex + (i * 2), "%2x", &value) != 1) {
+            return -1;
+        }
+        output[i] = (unsigned char)value;
+    }
+    *output_len = (unsigned int)(hex_len / 2);
+    return 0;
+}
+
+static int perform_signed_decrypt_datakey_request(sig_params_t *params, const char *payload, sig_str_t *response_body, long *http_status)
+{
+    CURL *curl = NULL;
+    CURLcode curl_code;
+    struct curl_slist *headers = NULL;
+    sig_params_t request_params;
+    char uri[URI_PREFIX_MAX_LEN + 32];
+    char url[URL_MAX_LEN];
+
+    memset(&request_params, 0, sizeof(request_params));
+    request_params = *params;
+    request_params.headers.data = NULL;
+    request_params.headers.len = 0;
+    request_params.headers.alloc = 0;
+    request_params.method = (sig_str_t)sig_str("POST");
+    request_params.payload = (sig_str_t)sig_str((char *)payload);
+    request_params.query_str = (sig_str_t)sig_str("");
+
+    if (snprintf(uri, sizeof(uri), "%s%s", params->uri_prefix.data, DECRYPT_DATAKEY_API) < 0) {
+        return -1;
+    }
+    request_params.uri = (sig_str_t)sig_str(uri);
+
+    if (sig_headers_add(&request_params.headers, "Content-Type", "application/json") == NULL) {
+        sig_headers_free(&request_params.headers);
+        return -1;
+    }
+    if (sig_headers_get(&params->headers, SECURITY_TOKEN_HEADER) != NULL) {
+        sig_header_t *token_header = sig_headers_get(&params->headers, SECURITY_TOKEN_HEADER);
+        if (sig_headers_add(&request_params.headers, SECURITY_TOKEN_HEADER, token_header->value.data) == NULL) {
+            sig_headers_free(&request_params.headers);
+            return -1;
+        }
+    }
+
+    if (sig_sign(&request_params) != SIG_OK) {
+        sig_headers_free(&request_params.headers);
+        return -1;
+    }
+
+    curl_code = curl_global_init(CURL_GLOBAL_ALL);
+    if (curl_code != CURLE_OK) {
+        sig_headers_free(&request_params.headers);
+        return -1;
+    }
+
+    curl = curl_easy_init();
+    if (curl == NULL) {
+        sig_headers_free(&request_params.headers);
+        curl_global_cleanup();
+        return -1;
+    }
+
+    snprintf(url, sizeof(url), "https://%s%s?", params->host.data, uri);
+    for (size_t i = 0; i < request_params.headers.len; i++) {
+        char header[1024];
+        snprintf(
+            header,
+            sizeof(header),
+            "%s: %s",
+            request_params.headers.data[i].name.data,
+            request_params.headers.data[i].value.data
+        );
+        headers = curl_slist_append(headers, header);
+    }
+
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 10000L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 0L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_memory_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, response_body);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "POST");
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_UNIX_SOCKET_PATH, params->socket_path.data);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
+
+    curl_code = curl_easy_perform(curl);
+    if (curl_code != CURLE_OK) {
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        sig_headers_free(&request_params.headers);
+        curl_global_cleanup();
+        return -1;
+    }
+
+    curl_easy_getinfo(curl, CURLINFO_HTTP_CODE, http_status);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    sig_headers_free(&request_params.headers);
+    curl_global_cleanup();
+    return 0;
+}
+
+static int decrypt_datakey_via_proxy(const bridge_request_t *request, sig_params_t *params, unsigned char *plaintext, unsigned int *plaintext_len)
+{
+    struct connect_info conn;
+    sig_str_t response_body = {0};
+    struct json_object *response_json = NULL;
+    struct json_object *data_key = NULL;
+    char payload[9000];
+    char length_str[32];
+    long http_status = 0;
+
+    memset(&conn, 0, sizeof(conn));
+    if (setup_proxy(&conn, PARENT_CID, request->proxy_port) != PX_NO_ERROR) {
+        return -1;
+    }
+
+    snprintf(length_str, sizeof(length_str), "%zu", strlen(request->ciphertext) / 2);
+    snprintf(
+        payload,
+        sizeof(payload),
+        "{\"key_id\":\"%s\",\"cipher_text\":\"%s\",\"datakey_cipher_length\":\"%s\"}",
+        request->key_id,
+        request->ciphertext,
+        length_str
+    );
+
+    if (perform_signed_decrypt_datakey_request(params, payload, &response_body, &http_status) != 0) {
+        close_proxy(&conn);
+        return -1;
+    }
+    close_proxy(&conn);
+
+    if (http_status != HTTPS_OK || response_body.data == NULL) {
+        if (response_body.data != NULL) {
+            fprintf(stderr, "HTTPS status: %ld\nKMS response content:\n%s\n", http_status, response_body.data);
+            free(response_body.data);
+        }
+        return -1;
+    }
+
+    response_json = json_tokener_parse(response_body.data);
+    free(response_body.data);
+    if (response_json == NULL) {
+        return -1;
+    }
+    if (!json_object_object_get_ex(response_json, "data_key", &data_key)) {
+        json_object_put(response_json);
+        return -1;
+    }
+    if (hex_to_bytes(json_object_get_string(data_key), plaintext, plaintext_len) != 0) {
+        json_object_put(response_json);
+        return -1;
+    }
+
+    json_object_put(response_json);
+    return 0;
+}
+
 static const char *kms_status_message(unsigned long status)
 {
     switch (status) {
@@ -352,9 +549,6 @@ static int handle_decrypt_data_key(const bridge_request_t *request, sig_params_t
 {
     unsigned char plaintext[MAX_PLAINTEXT_BYTES];
     unsigned int plaintext_len = sizeof(plaintext);
-    plain_cipher_buff_t data;
-    keyid_handle_t handle;
-    unsigned long status;
     char *encoded_plaintext = NULL;
     struct json_object *response = NULL;
 
@@ -363,21 +557,12 @@ static int handle_decrypt_data_key(const bridge_request_t *request, sig_params_t
         return 1;
     }
 
-    handle.key_id = (char *)request->key_id;
-    handle.len = strlen(request->key_id);
-
-    data.data_in = (const unsigned char *)request->ciphertext;
-    data.data_in_len = strlen(request->ciphertext);
-    data.data_out = plaintext;
-    data.data_out_len = &plaintext_len;
-
-    status = kms_decrypt_data_blocking_with_proxy(params, &handle, &data, PARENT_CID, request->proxy_port);
-    if (status != KMS_SUCCESS) {
-        emit_error(kms_status_message(status));
+    if (decrypt_datakey_via_proxy(request, params, plaintext, &plaintext_len) != 0) {
+        emit_error("failed to decrypt DEK via decrypt-datakey");
         return 1;
     }
 
-    encoded_plaintext = g_base64_encode(data.data_out, *(data.data_out_len));
+    encoded_plaintext = g_base64_encode(plaintext, plaintext_len);
     response = json_object_new_object();
     json_object_object_add(response, "plaintext", json_object_new_string(encoded_plaintext));
     emit_success(response);

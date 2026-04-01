@@ -229,6 +229,27 @@ def test_enclave_rejects_invalid_transaction_payload():
     }
 
 
+def test_kms_client_extracts_json_from_last_stdout_line():
+    module = load_module("eth1_enclave_server", "application/eth1/enclave/server.py")
+
+    response = module.parse_helper_json_output(
+        "unix socket listening...\n[bridge] generate_random status=0 len=32 hex=abcd\n{\"random\":\"YWJjZA==\"}\n"
+    )
+
+    assert response == {"random": "YWJjZA=="}
+
+
+def test_kms_client_reports_non_json_helper_output():
+    module = load_module("eth1_enclave_server", "application/eth1/enclave/server.py")
+
+    try:
+        module.parse_helper_json_output("unix socket listening...\nbridge failed badly\n")
+    except ValueError as exc:
+        assert "non-JSON output" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for non-JSON helper output")
+
+
 def test_server_create_wallet_persists_wallet_record_and_hides_it(monkeypatch):
     module = load_module("eth1_parent_server", "application/eth1/server/app.py")
     recorded = []
@@ -521,6 +542,14 @@ def test_enclave_bridge_sources_exist():
 
     assert bridge_source.exists()
     assert bridge_makefile.exists()
+
+
+def test_enclave_bridge_uses_decrypt_datakey_api_for_encrypted_data_keys():
+    bridge_source_text = (
+        REPO_ROOT / "application/eth1/enclave/qingtian_kms_bridge.c"
+    ).read_text()
+
+    assert "decrypt-datakey" in bridge_source_text
 
 
 def test_qingtian_rebuild_script_exists_with_expected_steps():
