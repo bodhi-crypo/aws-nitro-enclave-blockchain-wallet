@@ -98,6 +98,18 @@ class FakeWalletRecordStore:
         return self.records[wallet_id]
 
 
+class FakeHelperSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+
+    def request(self, payload):
+        self.requests.append(payload)
+        if not self.responses:
+            raise AssertionError("no fake helper response left")
+        return self.responses.pop(0)
+
+
 def test_enclave_create_wallet_returns_wallet_record_encrypted_by_data_key():
     module = load_module("eth1_enclave_server", "application/eth1/enclave/server.py")
     wallet_backend = FakeWalletBackend()
@@ -167,6 +179,71 @@ def test_enclave_sign_transaction_uses_wallet_record_and_kms_decrypt():
     assert wallet_backend.signed == [
         ({"nonce": 1, "gas": 21000, "chainId": 11155111, "value": "0.1"}, "11" * 32)
     ]
+
+
+def test_huawei_kms_client_reuses_persistent_helper_session(monkeypatch):
+    module = load_module("eth1_enclave_server", "application/eth1/enclave/server.py")
+    session = FakeHelperSession(
+        [
+            {"random": "ERERERERERERERERERERERERERERERERERERERERERE="},
+            {"plaintext": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=", "ciphertext": "encrypted-dek"},
+        ]
+    )
+
+    monkeypatch.setattr(module, "get_kms_helper_session", lambda helper_command: session)
+    monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("subprocess.run should not be used")))
+
+    client = module.HuaweiKmsClient(
+        credentials={"access": "ak", "secret": "sk"},
+        kms_config={"key_id": "kms-key-1", "endpoint": "kms.test", "project_id": "project-1", "proxy_port": 8000},
+        helper_command="/app/qingtian_kms_bridge",
+    )
+
+    assert client.generate_random(32) == b"\x11" * 32
+    assert client.create_data_key() == {"plaintext": b"\x22" * 32, "ciphertext": "encrypted-dek"}
+    assert [request["action"] for request in session.requests] == ["generate_random", "create_data_key"]
+
+
+def test_sign_transaction_uses_cached_dek_within_ttl():
+    module = load_module("eth1_enclave_server", "application/eth1/enclave/server.py")
+    wallet_backend = FakeWalletBackend()
+    kms_client = FakeKmsClient()
+    wallet_record_crypto = FakeWalletRecordCrypto()
+    wallet_record = {
+        "version": 1,
+        "wallet_id": "wallet-1",
+        "address": "0xaddr1",
+        "kms_key_id": "kms-key-1",
+        "encrypted_data_key": "encrypted-dek",
+        "encrypted_private_key": "encrypted-private-key",
+        "nonce": "nonce-value",
+        "tag": "tag-value",
+    }
+    current_time = [100.0]
+    dek_cache = module.TimedDekCache(max_entries=8, ttl_seconds=60, time_fn=lambda: current_time[0])
+
+    first = module.sign_transaction(
+        "wallet-1",
+        {"nonce": 1, "gas": 21000, "chainId": 11155111, "value": "0.1"},
+        wallet_record=wallet_record,
+        wallet_backend=wallet_backend,
+        kms_client=kms_client,
+        wallet_record_crypto=wallet_record_crypto,
+        dek_cache=dek_cache,
+    )
+    second = module.sign_transaction(
+        "wallet-1",
+        {"nonce": 2, "gas": 21000, "chainId": 11155111, "value": "0.1"},
+        wallet_record=wallet_record,
+        wallet_backend=wallet_backend,
+        kms_client=kms_client,
+        wallet_record_crypto=wallet_record_crypto,
+        dek_cache=dek_cache,
+    )
+
+    assert first["signed_tx"] == "0xsigned"
+    assert second["signed_tx"] == "0xsigned"
+    assert kms_client.decrypted_data_keys == ["encrypted-dek"]
 
 
 def test_enclave_unknown_wallet_returns_structured_error():
@@ -573,6 +650,23 @@ def test_enclave_bridge_uses_qingtian_attestation_api_for_decrypt_datakey():
     assert '#include "attestation.h"' in bridge_source_text
     assert "attestation_rsa_keypair_new" in bridge_source_text
     assert "get_attestation_doc" in bridge_source_text
+
+
+def test_enclave_bridge_supports_persistent_request_loop():
+    bridge_source_text = (
+        REPO_ROOT / "application/eth1/enclave/qingtian_kms_bridge.c"
+    ).read_text()
+
+    assert "getline(" in bridge_source_text
+    assert "while (1)" in bridge_source_text
+
+
+def test_enclave_bridge_uses_attestation_cache_ttl_env():
+    bridge_source_text = (
+        REPO_ROOT / "application/eth1/enclave/qingtian_kms_bridge.c"
+    ).read_text()
+
+    assert "HWC_ATTESTATION_CACHE_TTL_SECONDS" in bridge_source_text
 
 
 def test_qingtian_rebuild_script_exists_with_expected_steps():

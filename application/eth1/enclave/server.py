@@ -4,7 +4,9 @@ import os
 import shlex
 import socket
 import subprocess
+import time
 import uuid
+from collections import OrderedDict
 
 
 class WalletNotFoundError(Exception):
@@ -15,6 +17,100 @@ class WalletNotFoundError(Exception):
 
 class WalletRecordError(ValueError):
     pass
+
+
+class PersistentHelperSession:
+    def __init__(self, helper_command):
+        self.helper_command = helper_command
+        self.process = None
+
+    def request(self, payload):
+        last_error = None
+        for _ in range(2):
+            self._ensure_process()
+            try:
+                self.process.stdin.write(json.dumps(payload) + "\n")
+                self.process.stdin.flush()
+                return self._read_response()
+            except (BrokenPipeError, OSError, RuntimeError) as exc:
+                last_error = exc
+                self.close()
+        raise RuntimeError(f"KMS helper failed: {last_error}")
+
+    def close(self):
+        if self.process is None:
+            return
+        try:
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.process.terminate()
+            self.process.wait(timeout=1)
+        except Exception:
+            try:
+                self.process.kill()
+            except Exception:
+                pass
+        self.process = None
+
+    def _ensure_process(self):
+        if self.process is not None and self.process.poll() is None:
+            return
+        self.process = subprocess.Popen(
+            shlex.split(self.helper_command),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+    def _read_response(self):
+        lines = []
+        while True:
+            line = self.process.stdout.readline()
+            if line == "":
+                raise RuntimeError("KMS helper exited before returning a response")
+            lines.append(line)
+            try:
+                return parse_helper_json_output("".join(lines))
+            except ValueError:
+                continue
+
+
+class TimedDekCache:
+    def __init__(self, max_entries=256, ttl_seconds=60, time_fn=None):
+        self.max_entries = max(0, int(max_entries))
+        self.ttl_seconds = max(0, int(ttl_seconds))
+        self.time_fn = time_fn or time.monotonic
+        self.entries = OrderedDict()
+
+    def get(self, key):
+        if not self.is_enabled():
+            return None
+        entry = self.entries.get(key)
+        if entry is None:
+            return None
+        expires_at, value = entry
+        if self.time_fn() >= expires_at:
+            self.entries.pop(key, None)
+            return None
+        self.entries.move_to_end(key)
+        return value
+
+    def set(self, key, value):
+        if not self.is_enabled():
+            return
+        expires_at = self.time_fn() + self.ttl_seconds
+        self.entries[key] = (expires_at, value)
+        self.entries.move_to_end(key)
+        while len(self.entries) > self.max_entries:
+            self.entries.popitem(last=False)
+
+    def is_enabled(self):
+        return self.max_entries > 0 and self.ttl_seconds > 0
 
 
 class Web3WalletBackend:
@@ -110,25 +206,17 @@ class HuaweiKmsClient:
         return decode_base64(response["plaintext"], "plaintext")
 
     def _run(self, action, payload):
-        process = subprocess.run(
-            shlex.split(self.helper_command),
-            input=json.dumps(
-                {
-                    "action": action,
-                    "credentials": self.credentials,
-                    "kms_config": self.kms_config,
-                    **payload,
-                }
-            ),
-            capture_output=True,
-            check=False,
-            text=True,
+        session = get_kms_helper_session(self.helper_command)
+        started_at = time.perf_counter()
+        response = session.request(
+            {
+                "action": action,
+                "credentials": self.credentials,
+                "kms_config": self.kms_config,
+                **payload,
+            }
         )
-        if process.returncode != 0:
-            stderr = (process.stderr or process.stdout or "").strip()
-            raise RuntimeError(f"KMS helper failed: {stderr}")
-
-        response = parse_helper_json_output(process.stdout or "")
+        perf_log("kms_helper", action=action, elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2))
         if response.get("status") == "error":
             raise RuntimeError(response.get("message", "KMS helper returned an error"))
         return response
@@ -159,6 +247,20 @@ def get_kms_client(kms_client=None, credentials=None, kms_config=None):
     if kms_client is not None:
         return kms_client
     return HuaweiKmsClient(credentials=credentials, kms_config=kms_config)
+
+
+def get_kms_helper_session(helper_command):
+    session = HELPER_SESSIONS.get(helper_command)
+    if session is None:
+        session = PersistentHelperSession(helper_command)
+        HELPER_SESSIONS[helper_command] = session
+    return session
+
+
+def get_dek_cache(dek_cache=None):
+    if dek_cache is not None:
+        return dek_cache
+    return DEK_CACHE
 
 
 def create_wallet(
@@ -218,6 +320,7 @@ def sign_transaction(
     wallet_record_crypto=None,
     credentials=None,
     kms_config=None,
+    dek_cache=None,
 ):
     validate_transaction_payload(transaction_payload)
     wallet_backend = get_wallet_backend(wallet_backend)
@@ -230,7 +333,18 @@ def sign_transaction(
     validated_wallet_record = validate_wallet_record(wallet_record, wallet_id=wallet_id)
     wallet_record_crypto = get_wallet_record_crypto(wallet_record_crypto)
     kms_client = get_kms_client(kms_client, credentials=credentials, kms_config=kms_config)
-    plaintext_data_key = kms_client.decrypt_data_key(validated_wallet_record["encrypted_data_key"])
+    dek_cache = get_dek_cache(dek_cache)
+    dek_cache_key = (
+        validated_wallet_record["kms_key_id"],
+        validated_wallet_record["encrypted_data_key"],
+    )
+    plaintext_data_key = dek_cache.get(dek_cache_key)
+    if plaintext_data_key is None:
+        perf_log("dek_cache", result="miss")
+        plaintext_data_key = kms_client.decrypt_data_key(validated_wallet_record["encrypted_data_key"])
+        dek_cache.set(dek_cache_key, plaintext_data_key)
+    else:
+        perf_log("dek_cache", result="hit")
     private_key = wallet_record_crypto.decrypt_private_key(validated_wallet_record, plaintext_data_key)
     signed = wallet_backend.sign_transaction(transaction_payload, private_key)
     return {"wallet_id": wallet_id, **signed}
@@ -265,6 +379,11 @@ def parse_helper_json_output(stdout_text):
         except json.JSONDecodeError:
             continue
     raise ValueError(f"KMS helper returned non-JSON output: {stdout_text.strip()}")
+
+
+def perf_log(event, **fields):
+    field_parts = [f"{key}={value}" for key, value in fields.items()]
+    print(f"[perf] event={event} {' '.join(field_parts)}".strip(), flush=True)
 
 
 def validate_wallet_record(wallet_record, wallet_id=None):
@@ -437,6 +556,11 @@ def main():
 
 
 WALLET_STORE = {}
+HELPER_SESSIONS = {}
+DEK_CACHE = TimedDekCache(
+    max_entries=os.getenv("HWC_DEK_CACHE_MAX_ENTRIES", "256"),
+    ttl_seconds=os.getenv("HWC_DEK_CACHE_TTL_SECONDS", "60"),
+)
 
 
 if __name__ == "__main__":

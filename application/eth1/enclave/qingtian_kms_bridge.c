@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "attestation.h"
 #include "enclave_proxy.h"
@@ -24,6 +25,7 @@
 #define SECURITY_TOKEN_HEADER "X-Security-Token"
 #define DECRYPT_DATAKEY_API "decrypt-datakey"
 #define HTTPS_OK 200
+#define DEFAULT_ATTESTATION_CACHE_TTL_SECONDS 60
 
 typedef struct bridge_request_s {
     char *action;
@@ -38,8 +40,16 @@ typedef struct bridge_request_s {
     char *ciphertext;
 } bridge_request_t;
 
+typedef struct attestation_cache_s {
+    char *attestation_b64;
+    unsigned int attestation_b64_len;
+    struct rsa_keypair *keypair;
+    long long expires_at;
+} attestation_cache_t;
+
 static void free_request(bridge_request_t *request);
 static int decrypt_datakey_via_proxy(const bridge_request_t *request, sig_params_t *params, unsigned char *plaintext, unsigned int *plaintext_len);
+static attestation_cache_t g_attestation_cache = {0};
 
 static void cleanup_stream_buf(struct stream_buf *buf)
 {
@@ -54,19 +64,70 @@ static void cleanup_stream_buf(struct stream_buf *buf)
     buf->len = 0;
 }
 
+static long long monotonic_seconds(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (long long)ts.tv_sec;
+}
+
+static unsigned int get_attestation_cache_ttl_seconds(void)
+{
+    const char *raw = getenv("HWC_ATTESTATION_CACHE_TTL_SECONDS");
+    char *endptr = NULL;
+    long parsed = 0;
+
+    if (raw == NULL || raw[0] == '\0') {
+        return DEFAULT_ATTESTATION_CACHE_TTL_SECONDS;
+    }
+
+    parsed = strtol(raw, &endptr, 10);
+    if (endptr == raw || *endptr != '\0' || parsed < 0) {
+        return DEFAULT_ATTESTATION_CACHE_TTL_SECONDS;
+    }
+    return (unsigned int)parsed;
+}
+
+static void cleanup_attestation_cache(void)
+{
+    if (g_attestation_cache.attestation_b64 != NULL) {
+        g_free(g_attestation_cache.attestation_b64);
+        g_attestation_cache.attestation_b64 = NULL;
+    }
+    if (g_attestation_cache.keypair != NULL) {
+        attestation_rsa_keypair_destroy(g_attestation_cache.keypair);
+        g_attestation_cache.keypair = NULL;
+    }
+    g_attestation_cache.attestation_b64_len = 0;
+    g_attestation_cache.expires_at = 0;
+}
+
 static int build_attestation_document_base64(
-    char **attestation_b64,
+    const char **attestation_b64,
     unsigned int *attestation_b64_len,
     struct rsa_keypair **keypair_out)
 {
     struct stream_buf attestation_doc = {0};
     int rc = -1;
+    unsigned int ttl_seconds = get_attestation_cache_ttl_seconds();
+    long long now = monotonic_seconds();
 
     if (attestation_b64 == NULL || attestation_b64_len == NULL || keypair_out == NULL) {
         return -1;
     }
 
-    *keypair_out = NULL;
+    if (g_attestation_cache.attestation_b64 != NULL &&
+        g_attestation_cache.keypair != NULL &&
+        (ttl_seconds == 0 || now < g_attestation_cache.expires_at)) {
+        *attestation_b64 = g_attestation_cache.attestation_b64;
+        *attestation_b64_len = g_attestation_cache.attestation_b64_len;
+        *keypair_out = g_attestation_cache.keypair;
+        return 0;
+    }
+
+    cleanup_attestation_cache();
     attestation_doc.capacity = attestation_doc.len = sizeof(struct attestation_document);
     attestation_doc.buffer = malloc(attestation_doc.capacity);
     if (attestation_doc.buffer == NULL) {
@@ -74,30 +135,32 @@ static int build_attestation_document_base64(
     }
     memset(attestation_doc.buffer, 0, attestation_doc.capacity);
 
-    *keypair_out = attestation_rsa_keypair_new(RSA_2048);
-    if (*keypair_out == NULL) {
+    g_attestation_cache.keypair = attestation_rsa_keypair_new(RSA_2048);
+    if (g_attestation_cache.keypair == NULL) {
         cleanup_stream_buf(&attestation_doc);
         return -1;
     }
 
-    rc = get_attestation_doc(*keypair_out, &attestation_doc);
+    rc = get_attestation_doc(g_attestation_cache.keypair, &attestation_doc);
     if (rc != NO_ERROR) {
         cleanup_stream_buf(&attestation_doc);
-        attestation_rsa_keypair_destroy(*keypair_out);
-        *keypair_out = NULL;
+        cleanup_attestation_cache();
         return -1;
     }
 
-    *attestation_b64 = (char *)g_base64_encode(attestation_doc.buffer, attestation_doc.len);
-    if (*attestation_b64 == NULL) {
+    g_attestation_cache.attestation_b64 = (char *)g_base64_encode(attestation_doc.buffer, attestation_doc.len);
+    if (g_attestation_cache.attestation_b64 == NULL) {
         cleanup_stream_buf(&attestation_doc);
-        attestation_rsa_keypair_destroy(*keypair_out);
-        *keypair_out = NULL;
+        cleanup_attestation_cache();
         return -1;
     }
-    *attestation_b64_len = strlen(*attestation_b64);
+    g_attestation_cache.attestation_b64_len = strlen(g_attestation_cache.attestation_b64);
+    g_attestation_cache.expires_at = now + ttl_seconds;
 
     cleanup_stream_buf(&attestation_doc);
+    *attestation_b64 = g_attestation_cache.attestation_b64;
+    *attestation_b64_len = g_attestation_cache.attestation_b64_len;
+    *keypair_out = g_attestation_cache.keypair;
     return 0;
 }
 
@@ -108,6 +171,7 @@ static void emit_error(const char *message)
     json_object_object_add(response, "message", json_object_new_string(message ? message : "unknown error"));
     fputs(json_object_to_json_string_ext(response, JSON_C_TO_STRING_PLAIN), stdout);
     fputc('\n', stdout);
+    fflush(stdout);
     json_object_put(response);
 }
 
@@ -115,6 +179,7 @@ static void emit_success(struct json_object *payload)
 {
     fputs(json_object_to_json_string_ext(payload, JSON_C_TO_STRING_PLAIN), stdout);
     fputc('\n', stdout);
+    fflush(stdout);
 }
 
 static size_t write_memory_callback(void *contents, size_t size, size_t nmemb, void *userp)
@@ -136,29 +201,20 @@ static size_t write_memory_callback(void *contents, size_t size, size_t nmemb, v
 
 static char *read_stdin_payload(void)
 {
-    char *buffer = calloc(1, MAX_STDIN_BYTES + 1);
-    size_t total = 0;
+    char *buffer = NULL;
+    size_t capacity = 0;
+    ssize_t read_bytes = getline(&buffer, &capacity, stdin);
 
-    if (buffer == NULL) {
+    if (read_bytes < 0) {
+        free(buffer);
         return NULL;
     }
 
-    while (!feof(stdin)) {
-        size_t remain = MAX_STDIN_BYTES - total;
-        size_t read_bytes;
-        if (remain == 0) {
-            free(buffer);
-            return NULL;
-        }
-        read_bytes = fread(buffer + total, 1, remain, stdin);
-        total += read_bytes;
-        if (ferror(stdin)) {
-            free(buffer);
-            return NULL;
-        }
+    while (read_bytes > 0 &&
+        (buffer[read_bytes - 1] == '\n' || buffer[read_bytes - 1] == '\r')) {
+        buffer[read_bytes - 1] = '\0';
+        read_bytes--;
     }
-
-    buffer[total] = '\0';
     return buffer;
 }
 
@@ -282,7 +338,6 @@ static int init_sig_params(sig_params_t *params, const bridge_request_t *request
     if (uri_prefix == NULL || socket_path == NULL) {
         free(uri_prefix);
         free(socket_path);
-        free_request(request);
         return -1;
     }
 
@@ -385,16 +440,9 @@ static int perform_signed_decrypt_datakey_request(sig_params_t *params, const ch
         return -1;
     }
 
-    curl_code = curl_global_init(CURL_GLOBAL_ALL);
-    if (curl_code != CURLE_OK) {
-        sig_headers_free(&request_params.headers);
-        return -1;
-    }
-
     curl = curl_easy_init();
     if (curl == NULL) {
         sig_headers_free(&request_params.headers);
-        curl_global_cleanup();
         return -1;
     }
 
@@ -411,7 +459,7 @@ static int perform_signed_decrypt_datakey_request(sig_params_t *params, const ch
         headers = curl_slist_append(headers, header);
     }
 
-    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 10000L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
@@ -430,7 +478,6 @@ static int perform_signed_decrypt_datakey_request(sig_params_t *params, const ch
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
         sig_headers_free(&request_params.headers);
-        curl_global_cleanup();
         return -1;
     }
 
@@ -438,7 +485,6 @@ static int perform_signed_decrypt_datakey_request(sig_params_t *params, const ch
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     sig_headers_free(&request_params.headers);
-    curl_global_cleanup();
     return 0;
 }
 
@@ -453,7 +499,7 @@ static int decrypt_datakey_via_proxy(const bridge_request_t *request, sig_params
     struct stream_buf plain_text = {0};
     gsize ciphertext_recipient_len = 0;
     guchar *ciphertext_recipient_bytes = NULL;
-    char *attestation_b64 = NULL;
+    const char *attestation_b64 = NULL;
     unsigned int attestation_b64_len = 0;
     unsigned int payload_len = 0;
     char *payload = NULL;
@@ -475,7 +521,6 @@ static int decrypt_datakey_via_proxy(const bridge_request_t *request, sig_params
         attestation_b64_len + 256;
     payload = calloc(1, payload_len);
     if (payload == NULL) {
-        g_free(attestation_b64);
         close_proxy(&conn);
         return -1;
     }
@@ -489,7 +534,6 @@ static int decrypt_datakey_via_proxy(const bridge_request_t *request, sig_params
         length_str,
         attestation_b64
     );
-    g_free(attestation_b64);
 
     if (perform_signed_decrypt_datakey_request(params, payload, &response_body, &http_status) != 0) {
         free(payload);
@@ -700,38 +744,51 @@ int main(void)
     sig_params_t params;
     int rc;
 
-    payload = read_stdin_payload();
-    if (payload == NULL) {
-        emit_error("failed to read bridge request");
+    if (curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
+        emit_error("failed to initialize curl");
         return 1;
     }
 
-    if (parse_request(payload, &request) != 0) {
-        free(payload);
-        emit_error("invalid bridge request");
-        return 1;
-    }
+    while (1) {
+        payload = read_stdin_payload();
+        if (payload == NULL) {
+            break;
+        }
 
-    if (init_sig_params(&params, &request) != 0) {
+        if (parse_request(payload, &request) != 0) {
+            free(payload);
+            emit_error("invalid bridge request");
+            continue;
+        }
+
+        if (init_sig_params(&params, &request) != 0) {
+            free_request(&request);
+            free(payload);
+            emit_error("failed to initialize signature parameters");
+            continue;
+        }
+
+        if (strcmp(request.action, "generate_random") == 0) {
+            rc = handle_generate_random(&request, &params);
+        } else if (strcmp(request.action, "create_data_key") == 0) {
+            rc = handle_create_data_key(&request, &params);
+        } else if (strcmp(request.action, "decrypt_data_key") == 0) {
+            rc = handle_decrypt_data_key(&request, &params);
+        } else {
+            emit_error("unsupported action");
+            rc = 1;
+        }
+
+        cleanup_sig_params(&params);
         free_request(&request);
         free(payload);
-        emit_error("failed to initialize signature parameters");
-        return 1;
+
+        if (rc != 0 && ferror(stdout)) {
+            break;
+        }
     }
 
-    if (strcmp(request.action, "generate_random") == 0) {
-        rc = handle_generate_random(&request, &params);
-    } else if (strcmp(request.action, "create_data_key") == 0) {
-        rc = handle_create_data_key(&request, &params);
-    } else if (strcmp(request.action, "decrypt_data_key") == 0) {
-        rc = handle_decrypt_data_key(&request, &params);
-    } else {
-        emit_error("unsupported action");
-        rc = 1;
-    }
-
-    cleanup_sig_params(&params);
-    free_request(&request);
-    free(payload);
-    return rc;
+    cleanup_attestation_cache();
+    curl_global_cleanup();
+    return 0;
 }
