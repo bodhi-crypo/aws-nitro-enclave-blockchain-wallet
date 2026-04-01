@@ -507,6 +507,9 @@ def test_enclave_dockerfile_uses_shell_wrapper_entrypoint():
 
     assert 'COPY ./application/eth1/enclave/start.sh ./start.sh' in dockerfile_text
     assert 'CMD ["/app/start.sh"]' in dockerfile_text
+    assert 'ENCLAVE_LOG_DIR="${ENCLAVE_LOG_DIR:-/var/log/tee-wallet}"' in start_script_text
+    assert 'LOG_FILE="${ENCLAVE_LOG_FILE:-$ENCLAVE_LOG_DIR/service.log}"' in start_script_text
+    assert 'exec >>"$LOG_FILE" 2>&1' in start_script_text
     assert "python3 /app/server.py" in start_script_text
 
 
