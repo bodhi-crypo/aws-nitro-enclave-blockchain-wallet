@@ -523,6 +523,161 @@ systemctl status qt-enclave-env --no-pager
 
 如果后续你重写 Dockerfile，优先保留这个启动结构。
 
+### 4. Docker build context 必须是仓库根目录
+
+enclave 镜像现在不只是依赖 `application/eth1/enclave/`，还依赖：
+
+- `third_party/huawei-qingtian/`
+
+因此构建命令必须使用仓库根目录 `.` 作为 build context：
+
+```bash
+docker build -f application/eth1/enclave/Dockerfile . -t tee-wallet-enclave:v1
+```
+
+不能再用：
+
+docker build -f application/eth1/enclave/Dockerfile application/eth1 -t tee-wallet-enclave:v1
+
+否则 Dockerfile 看不到 vendored QingTian SDK 源码。
+
+### 5. 不要在 Docker build 阶段联网拉取 huawei-qingtian
+
+实际联调中，gitee.com 在 ECS/容器内访问不稳定，容易导致：
+
+- git clone ... timed out
+
+当前稳定方案是：
+
+- 先把 huawei-qingtian 源码 vendoring 到仓库
+- 只保留需要的最小目录：
+    - third_party/huawei-qingtian/enclave/qtsm
+    - third_party/huawei-qingtian/enclave/qtsm-sdk-c
+
+这样做的好处：
+
+- Docker build 不依赖外网
+- 构建更可复现
+- PCR0 更容易稳定
+
+### 6. vendored qtsm 源码构建前要创建 output/ 目录
+
+upstream third_party/huawei-qingtian/enclave/qtsm/lib/Makefile 会在构建时执行：
+
+cp libqtsm.so ../output/
+
+如果 output/ 目录不存在，会直接失败。
+
+当前 Dockerfile 里已经通过下面的方式修复：
+
+mkdir -p /opt/huawei-qingtian/enclave/qtsm/output
+
+### 7. builder 和 runtime 必须统一发行版
+
+曾经出现过：
+
+/app/qingtian_kms_bridge: error while loading shared libraries: libcbor.so.0.8
+
+根因是：
+
+- builder 使用 ubuntu:22.04
+- runtime 使用 Debian 系镜像
+
+导致 bridge 编译时链接到的 libcbor.so.0.8 在 runtime 里找不到。
+
+当前稳定方案：
+
+- builder：ubuntu:22.04
+- runtime：ubuntu:22.04
+
+不要再混用 Ubuntu builder 和 Debian runtime。
+
+### 8. host 当前使用静态 AK/SK，不再依赖 metadata
+
+第二阶段联调里，ECS metadata 的 /openstack/latest/securitykey 返回过：
+
+401 Unauthorized
+Please configure Cloud Service Agency first
+
+为了降低联调复杂度，当前 host gateway 已改成：
+
+- 只使用静态配置的：
+    - HWC_KMS_ACCESS_KEY
+    - HWC_KMS_SECRET_KEY
+    - HWC_KMS_SECURITY_TOKEN 可选
+- 不再依赖 metadata 回退
+
+### 9. createDataKey 生成的密文 DEK 必须走 decrypt-datakey
+
+这是本轮最关键的一条 KMS 语义经验。
+
+错误做法：
+
+- 把 createDataKey 返回的密文 DEK 送到 decrypt-data
+
+会导致 KMS 返回：
+
+KMS.2203
+Data key hash verification failed.
+
+当前修复结论：
+
+- 密文 DEK 必须走：
+    - decrypt-datakey
+- 不能误用：
+    - decrypt-data
+
+### 10. bridge stdout 可能混入日志，Python 侧不能直接 json.loads(stdout)
+
+实际联调中，bridge 或 vendored QingTian SDK 可能向 stdout 打日志，例如：
+
+unix socket listening...
+
+如果 Python 侧直接：
+
+json.loads(process.stdout)
+
+就会报：
+
+Expecting value: line 1 column 1 (char 0)
+
+当前修复结论：
+
+- Python 侧必须从 stdout 的最后一行向前查找合法 JSON
+- 不能假设整个 stdout 都是纯 JSON
+
+### 11. 当前稳定基线
+
+截至今天，当前联调通过的稳定基线是：
+
+- parent：C7t + QingTian Enclave + EulerOS 2.0
+- enclave build：repo root context + vendored third_party/huawei-qingtian
+- runtime：Ubuntu 22.04
+- 启动方式：start.sh -> python3 /app/server.py
+- KMS 通道：qt_proxy + qingtian_kms_bridge
+- host 凭证：静态 HWC_KMS_ACCESS_KEY / HWC_KMS_SECRET_KEY
+- KMS policy：先只绑定 PCR0
+- enclave 重建：默认走缓存，必要时再 NO_CACHE=1
+
+### 12. 当前推荐的一键重建方式
+
+平时开发直接使用：
+
+bash scripts/rebuild_eth1_qingtian_enclave.sh
+
+只有在下面场景才建议强制全量重建：
+
+- 改了 Dockerfile
+- 改了系统依赖
+- 改了 requirements.txt
+- 更新了 third_party/huawei-qingtian
+- 怀疑缓存脏了
+
+命令：
+
+NO_CACHE=1 bash scripts/rebuild_eth1_qingtian_enclave.sh
+
+
 ## 本地 TODO
 
 - 将内存态 key registry 替换为外部加密存储或 sealed storage
