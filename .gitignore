@@ -24,3 +24,4 @@ application/wireguard/enclave/kms/*
 
 
 third_party/huawei-qingtian/
+.omc/
