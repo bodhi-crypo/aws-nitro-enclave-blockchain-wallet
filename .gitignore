@@ -21,3 +21,6 @@ application/eth2/
 *.key
 application/wireguard/third_party/*
 application/wireguard/enclave/kms/*
+
+
+third_party/huawei-qingtian/

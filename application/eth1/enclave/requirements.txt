@@ -1,1 +1,2 @@
 web3==5.23.0
+cryptography==43.0.1

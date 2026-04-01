@@ -1,0 +1,25 @@
+CC ?= gcc
+OUTPUT_DIR ?= /opt/build
+QINGTIAN_SRC ?= /opt/huawei-qingtian
+
+BRIDGE_SRC := qingtian_kms_bridge.c
+SDK_SRC := $(wildcard $(QINGTIAN_SRC)/enclave/qtsm-sdk-c/source/*.c)
+
+CFLAGS += -W -Os -g -fstack-protector-strong
+CFLAGS += -I $(QINGTIAN_SRC)/enclave/qtsm-sdk-c/include
+CFLAGS += -I $(QINGTIAN_SRC)/enclave/qtsm/include
+CFLAGS += $(shell pkg-config --cflags glib-2.0 json-c libcurl openssl)
+LDFLAGS += -L/usr/local/lib -Wl,-rpath,/usr/local/lib
+LDLIBS += -lqtsm -lpthread
+LDLIBS += $(shell pkg-config --libs glib-2.0 json-c libcurl openssl)
+
+all: $(OUTPUT_DIR)/qingtian_kms_bridge
+
+$(OUTPUT_DIR)/qingtian_kms_bridge: $(BRIDGE_SRC) $(SDK_SRC)
+	mkdir -p $(OUTPUT_DIR)
+	$(CC) $(CFLAGS) -o $@ $(BRIDGE_SRC) $(SDK_SRC) $(LDFLAGS) $(LDLIBS)
+
+.PHONY: clean
+
+clean:
+	rm -f $(OUTPUT_DIR)/qingtian_kms_bridge
