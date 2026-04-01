@@ -6,8 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "attestation.h"
 #include "enclave_proxy.h"
 #include "kms.h"
+#include "qtsm_lib.h"
 #include "signer.h"
 
 #define DATAKEY_BITS 256
@@ -38,6 +40,66 @@ typedef struct bridge_request_s {
 
 static void free_request(bridge_request_t *request);
 static int decrypt_datakey_via_proxy(const bridge_request_t *request, sig_params_t *params, unsigned char *plaintext, unsigned int *plaintext_len);
+
+static void cleanup_stream_buf(struct stream_buf *buf)
+{
+    if (buf == NULL) {
+        return;
+    }
+    if (buf->buffer != NULL) {
+        free(buf->buffer);
+        buf->buffer = NULL;
+    }
+    buf->capacity = 0;
+    buf->len = 0;
+}
+
+static int build_attestation_document_base64(
+    char **attestation_b64,
+    unsigned int *attestation_b64_len,
+    struct rsa_keypair **keypair_out)
+{
+    struct stream_buf attestation_doc = {0};
+    int rc = -1;
+
+    if (attestation_b64 == NULL || attestation_b64_len == NULL || keypair_out == NULL) {
+        return -1;
+    }
+
+    *keypair_out = NULL;
+    attestation_doc.capacity = attestation_doc.len = sizeof(struct attestation_document);
+    attestation_doc.buffer = malloc(attestation_doc.capacity);
+    if (attestation_doc.buffer == NULL) {
+        return -1;
+    }
+    memset(attestation_doc.buffer, 0, attestation_doc.capacity);
+
+    *keypair_out = attestation_rsa_keypair_new(RSA_2048);
+    if (*keypair_out == NULL) {
+        cleanup_stream_buf(&attestation_doc);
+        return -1;
+    }
+
+    rc = get_attestation_doc(*keypair_out, &attestation_doc);
+    if (rc != NO_ERROR) {
+        cleanup_stream_buf(&attestation_doc);
+        attestation_rsa_keypair_destroy(*keypair_out);
+        *keypair_out = NULL;
+        return -1;
+    }
+
+    *attestation_b64 = (char *)g_base64_encode(attestation_doc.buffer, attestation_doc.len);
+    if (*attestation_b64 == NULL) {
+        cleanup_stream_buf(&attestation_doc);
+        attestation_rsa_keypair_destroy(*keypair_out);
+        *keypair_out = NULL;
+        return -1;
+    }
+    *attestation_b64_len = strlen(*attestation_b64);
+
+    cleanup_stream_buf(&attestation_doc);
+    return 0;
+}
 
 static void emit_error(const char *message)
 {
@@ -386,7 +448,15 @@ static int decrypt_datakey_via_proxy(const bridge_request_t *request, sig_params
     sig_str_t response_body = {0};
     struct json_object *response_json = NULL;
     struct json_object *data_key = NULL;
-    char payload[9000];
+    struct json_object *ciphertext_recipient = NULL;
+    struct rsa_keypair *keypair = NULL;
+    struct stream_buf plain_text = {0};
+    gsize ciphertext_recipient_len = 0;
+    guchar *ciphertext_recipient_bytes = NULL;
+    char *attestation_b64 = NULL;
+    unsigned int attestation_b64_len = 0;
+    unsigned int payload_len = 0;
+    char *payload = NULL;
     char length_str[32];
     long http_status = 0;
 
@@ -395,20 +465,38 @@ static int decrypt_datakey_via_proxy(const bridge_request_t *request, sig_params
         return -1;
     }
 
-    snprintf(length_str, sizeof(length_str), "%zu", strlen(request->ciphertext) / 2);
-    snprintf(
-        payload,
-        sizeof(payload),
-        "{\"key_id\":\"%s\",\"cipher_text\":\"%s\",\"datakey_cipher_length\":\"%s\"}",
-        request->key_id,
-        request->ciphertext,
-        length_str
-    );
-
-    if (perform_signed_decrypt_datakey_request(params, payload, &response_body, &http_status) != 0) {
+    if (build_attestation_document_base64(&attestation_b64, &attestation_b64_len, &keypair) != 0) {
         close_proxy(&conn);
         return -1;
     }
+
+    snprintf(length_str, sizeof(length_str), "%zu", strlen(request->ciphertext) / 2);
+    payload_len = strlen(request->key_id) + strlen(request->ciphertext) + strlen(length_str) +
+        attestation_b64_len + 256;
+    payload = calloc(1, payload_len);
+    if (payload == NULL) {
+        g_free(attestation_b64);
+        close_proxy(&conn);
+        return -1;
+    }
+    snprintf(
+        payload,
+        payload_len,
+        "{\"key_id\":\"%s\",\"cipher_text\":\"%s\",\"datakey_cipher_length\":\"%s\","
+        "\"recipient\": {\"attestation_document\": \"%s\", \"key_encryption_algorithm\": \"RSAES_OAEP_SHA_256\"}}",
+        request->key_id,
+        request->ciphertext,
+        length_str,
+        attestation_b64
+    );
+    g_free(attestation_b64);
+
+    if (perform_signed_decrypt_datakey_request(params, payload, &response_body, &http_status) != 0) {
+        free(payload);
+        close_proxy(&conn);
+        return -1;
+    }
+    free(payload);
     close_proxy(&conn);
 
     if (http_status != HTTPS_OK || response_body.data == NULL) {
@@ -422,18 +510,52 @@ static int decrypt_datakey_via_proxy(const bridge_request_t *request, sig_params
     response_json = json_tokener_parse(response_body.data);
     free(response_body.data);
     if (response_json == NULL) {
+        attestation_rsa_keypair_destroy(keypair);
         return -1;
     }
-    if (!json_object_object_get_ex(response_json, "data_key", &data_key)) {
+    if (json_object_object_get_ex(response_json, "data_key", &data_key)) {
+        if (hex_to_bytes(json_object_get_string(data_key), plaintext, plaintext_len) != 0) {
+            json_object_put(response_json);
+            attestation_rsa_keypair_destroy(keypair);
+            return -1;
+        }
         json_object_put(response_json);
-        return -1;
+        attestation_rsa_keypair_destroy(keypair);
+        return 0;
     }
-    if (hex_to_bytes(json_object_get_string(data_key), plaintext, plaintext_len) != 0) {
+    if (!json_object_object_get_ex(response_json, "ciphertext_recipient", &ciphertext_recipient)) {
         json_object_put(response_json);
+        attestation_rsa_keypair_destroy(keypair);
         return -1;
     }
 
+    ciphertext_recipient_bytes = g_base64_decode(
+        json_object_get_string(ciphertext_recipient),
+        &ciphertext_recipient_len
+    );
+    if (ciphertext_recipient_bytes == NULL) {
+        json_object_put(response_json);
+        attestation_rsa_keypair_destroy(keypair);
+        return -1;
+    }
+
+    plain_text.buffer = plaintext;
+    plain_text.capacity = plain_text.len = *plaintext_len;
+    if (extract_data_from_envelop(
+            ciphertext_recipient_bytes,
+            (unsigned int)ciphertext_recipient_len,
+            keypair,
+            &plain_text) != KMS_SUCCESS) {
+        g_free(ciphertext_recipient_bytes);
+        json_object_put(response_json);
+        attestation_rsa_keypair_destroy(keypair);
+        return -1;
+    }
+
+    *plaintext_len = (unsigned int)plain_text.len;
+    g_free(ciphertext_recipient_bytes);
     json_object_put(response_json);
+    attestation_rsa_keypair_destroy(keypair);
     return 0;
 }
 

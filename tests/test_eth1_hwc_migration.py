@@ -555,6 +555,26 @@ def test_enclave_bridge_uses_decrypt_datakey_api_for_encrypted_data_keys():
     assert "decrypt-datakey" in bridge_source_text
 
 
+def test_enclave_bridge_attaches_attestation_to_decrypt_datakey_requests():
+    bridge_source_text = (
+        REPO_ROOT / "application/eth1/enclave/qingtian_kms_bridge.c"
+    ).read_text()
+
+    assert "recipient" in bridge_source_text
+    assert "attestation_document" in bridge_source_text
+    assert "RSAES_OAEP_SHA_256" in bridge_source_text
+
+
+def test_enclave_bridge_uses_qingtian_attestation_api_for_decrypt_datakey():
+    bridge_source_text = (
+        REPO_ROOT / "application/eth1/enclave/qingtian_kms_bridge.c"
+    ).read_text()
+
+    assert '#include "attestation.h"' in bridge_source_text
+    assert "attestation_rsa_keypair_new" in bridge_source_text
+    assert "get_attestation_doc" in bridge_source_text
+
+
 def test_qingtian_rebuild_script_exists_with_expected_steps():
     script_path = REPO_ROOT / "scripts/rebuild_eth1_qingtian_enclave.sh"
     script_text = script_path.read_text()
